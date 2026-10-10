@@ -1,0 +1,8 @@
+# dsh-facet bundle patch：一行挂载。
+# row name 必须等于包名——宿主按包名解析入口（@deepseek-ai/dsh-* 同款惯例）。
+# 客户端半区（浮窗）由 package.json 的 dsh.client 声明自动加入 web 名单
+# （served at /plugins/dsh-facet/client.js）。
+# 可调参数（homeDir / readyPing）在 profile 的用户层覆盖。
+- insert:
+    - id: dsh-facet
+      name: 'dsh-facet'
