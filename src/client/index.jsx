@@ -1,18 +1,53 @@
 // dsh-facet — 浏览器半区（浮窗）。
 //
-// 订阅宿主 SSE（/dsh-facet/events）：主 agent 调用 facet_ready 后，
-// 宿主广播 {slug, query, twoD, threeD}；本组件在 `shell.overlay`（全局浮层）
-// 上弹出可视化窗口：
-//  · 桌面：每个产物两扇窗（2D / 3D）左右并排，各自可拖动/最大化/刷新/关闭
-//  · 手机（<720px）：单窗 + 2D/3D 标签切换
+// 订阅宿主 SSE（/dsh-facet/events）：主 agent 调用 facet_ready 后，宿主广播
+// {slug, query, mode, views:[{kind,title,url}]}；本组件在 `shell.overlay`
+// （全局浮层）上按**视图清单**弹出可视化窗口：
+//  · 手机（<720px）：单窗 + N 个视图标签
+//  · 桌面：1 视图=单窗；2 视图=双窗并排；≥3 视图=单窗标签栏（标签栏自己长出来）
 //
-// 窗口只负责“壳”：内容一律 iframe 指到宿主路由（/dsh-facet/<slug>/2d.html），
-// 与回复里的链接是同一个地址——关掉窗口后从消息链接照样能再开。
+// 窗口只负责"壳"：内容一律 iframe 指到宿主路由（view.url），与回复里的链接
+// 是同一个地址——关掉窗口后从消息链接照样能再开。
 import { useEffect, useMemo, useRef, useState } from 'react'
 
 const ROUTE = '/dsh-facet'
 const EVENTS_URL = `${ROUTE}/events`
 const Z_BASE = 900000
+
+const KIND_ACCENT = {
+  diagram: '#E8590C',
+  tower: '#1C7ED6',
+  network: '#AE3EC9',
+  flow: '#2F9E44',
+  timeline: '#7048E8',
+}
+
+/** 词汇表外的视图（或旧版载荷）回退：旧 2d/3d 产物。 */
+function fallbackViews(slug) {
+  return [
+    { kind: 'diagram', title: '2D 结构图', url: `${ROUTE}/${slug}/2d.html` },
+    { kind: 'tower', title: '3D 视图', url: `${ROUTE}/${slug}/3d.html` },
+  ]
+}
+
+function normalizeViews(data) {
+  const slug = String(data?.slug ?? '')
+  if (slug === '') return []
+  if (Array.isArray(data.views) && data.views.length > 0) {
+    const out = []
+    for (const v of data.views) {
+      const kind = String(v?.kind ?? '')
+      const title = String(v?.title ?? kind)
+      const url = typeof v?.url === 'string' && v.url.length > 0
+        ? v.url
+        : `${ROUTE}/${slug}/${typeof v?.file === 'string' && v.file.length > 0 ? v.file : `${kind}.html`}`
+      if (kind.length === 0) continue
+      out.push({ kind, title, url })
+    }
+    if (out.length > 0) return out
+  }
+  return fallbackViews(slug)
+}
 
 function isMobileWidth() {
   return (typeof window !== 'undefined' ? window.innerWidth : 1280) < 720
@@ -34,9 +69,15 @@ function defaultRect(kind, index) {
     const w = Math.round(vw * 0.94)
     return { x: Math.round((vw - w) / 2), y: 56 + offset, w, h: Math.round(Math.min(vh * 0.76, 760)) }
   }
-  const w = kind === '3d' ? Math.min(680, Math.round(vw * 0.5)) : Math.min(500, Math.round(vw * 0.4))
+  if (kind === 'tabs') {
+    const w = Math.min(880, Math.round(vw * 0.7))
+    const h = Math.min(Math.round(vh * 0.74), 700)
+    return { x: Math.round((vw - w) / 2), y: 62 + offset, w, h }
+  }
+  const wide = kind === 'tower' || kind === 'network'
+  const w = wide ? Math.min(680, Math.round(vw * 0.5)) : Math.min(500, Math.round(vw * 0.4))
   const h = Math.min(Math.round(vh * 0.72), 680)
-  const x = kind === '3d'
+  const x = wide
     ? Math.min(vw - w - 12, Math.round(vw * 0.5 + 20))
     : Math.max(12, Math.round(vw * 0.5 - w - 20))
   return { x, y: 68 + offset, w, h }
@@ -44,7 +85,7 @@ function defaultRect(kind, index) {
 
 // ── 单扇浮窗 ──────────────────────────────────────────────────────────────
 
-function WindowFrame({ wid, title, accent, rect, z, onClose, onFocus, children }) {
+function WindowFrame({ title, accent, rect, z, onClose, onFocus, children }) {
   const [pos, setPos] = useState(rect)
   const [maximized, setMaximized] = useState(false)
   const drag = useRef(null)
@@ -104,10 +145,39 @@ function WindowFrame({ wid, title, accent, rect, z, onClose, onFocus, children }
   )
 }
 
+function TabbedViewer({ views }) {
+  const [tab, setTab] = useState(0)
+  const active = views[Math.min(tab, Math.max(views.length - 1, 0))]
+  if (active === undefined) return null
+  return (
+    <div className="facet-tabwrap">
+      <div className="facet-tabbar">
+        {views.map((v, i) => (
+          <button
+            key={`${v.kind}-${i}`}
+            className="facet-tab"
+            data-active={i === tab || undefined}
+            onClick={() => setTab(i)}
+          >
+            {v.title}
+          </button>
+        ))}
+      </div>
+      <iframe
+        key={active.url}
+        className="facet-frame"
+        src={active.url}
+        sandbox="allow-scripts allow-same-origin allow-popups"
+        title={active.title}
+      />
+    </div>
+  )
+}
+
 // ── 浮层主组件 ────────────────────────────────────────────────────────────
 
 function FacetWindows() {
-  const [artifacts, setArtifacts] = useState([]) // [{slug, query, ts}]（最新在后）
+  const [artifacts, setArtifacts] = useState([]) // [{slug, query, views, ts}]（最新在后）
   const [closedIds, setClosedIds] = useState([])
   const [order, setOrder] = useState([])
   const [mobile, setMobile] = useState(isMobileWidth)
@@ -126,9 +196,16 @@ function FacetWindows() {
         try {
           const data = JSON.parse(e.data)
           if (typeof data?.slug !== 'string' || data.slug === '') return
+          const views = normalizeViews(data)
+          if (views.length === 0) return
           setArtifacts((prev) => {
             const next = prev.filter((a) => a.slug !== data.slug)
-            next.push({ slug: data.slug, query: typeof data.query === 'string' ? data.query : data.slug, ts: Date.now() })
+            next.push({
+              slug: data.slug,
+              query: typeof data.query === 'string' ? data.query : data.slug,
+              views,
+              ts: Date.now(),
+            })
             return next.slice(-2)
           })
         } catch {
@@ -150,17 +227,37 @@ function FacetWindows() {
   const descriptors = useMemo(() => {
     const out = []
     artifacts.forEach((a, i) => {
-      if (mobile) {
+      const views = a.views
+      if (mobile || views.length >= 3) {
         out.push({
-          key: `${a.slug}:${a.ts}:single`,
-          kind: 'single',
-          artifact: a,
-          title: `${a.query} · 架构可视化`,
+          key: `${a.slug}:${a.ts}:tabs`,
+          type: 'tabs',
+          views,
+          title: views.length > 1 ? `${a.query}（${views.length} 视图）` : a.query,
+          accent: '#868E96',
           index: i,
         })
+      } else if (views.length === 2) {
+        views.forEach((v, j) => {
+          out.push({
+            key: `${a.slug}:${a.ts}:${v.kind}`,
+            type: 'single',
+            view: v,
+            title: `${a.query} · ${v.title}`,
+            accent: KIND_ACCENT[v.kind] ?? '#868E96',
+            index: i * 2 + j,
+          })
+        })
       } else {
-        out.push({ key: `${a.slug}:${a.ts}:2d`, kind: '2d', artifact: a, title: `${a.query} · 2D`, index: i * 2 })
-        out.push({ key: `${a.slug}:${a.ts}:3d`, kind: '3d', artifact: a, title: `${a.query} · 3D`, index: i * 2 + 1 })
+        const v = views[0]
+        out.push({
+          key: `${a.slug}:${a.ts}:${v.kind}`,
+          type: 'single',
+          view: v,
+          title: `${a.query} · ${v.title}`,
+          accent: KIND_ACCENT[v.kind] ?? '#868E96',
+          index: i,
+        })
       }
     })
     return out
@@ -188,45 +285,25 @@ function FacetWindows() {
       {live.map((d) => (
         <WindowFrame
           key={d.key}
-          wid={d.key}
           title={d.title}
-          accent={d.kind === '2d' ? '#E8590C' : '#1C7ED6'}
-          rect={defaultRect(d.kind, d.index)}
+          accent={d.accent}
+          rect={defaultRect(d.type === 'tabs' ? 'tabs' : d.view.kind, d.index)}
           z={zOf(d.key)}
           onClose={() => close(d.key)}
           onFocus={() => focus(d.key)}
         >
-          {d.kind === 'single'
-            ? <TabbedViewer artifact={d.artifact} />
+          {d.type === 'tabs'
+            ? <TabbedViewer views={d.views} />
             : (
               <iframe
                 className="facet-frame"
-                src={`${ROUTE}/${d.artifact.slug}/${d.kind}.html`}
+                src={d.view.url}
                 sandbox="allow-scripts allow-same-origin allow-popups"
                 title={d.title}
               />
             )}
         </WindowFrame>
       ))}
-    </div>
-  )
-}
-
-function TabbedViewer({ artifact }) {
-  const [tab, setTab] = useState('2d')
-  return (
-    <div className="facet-tabwrap">
-      <div className="facet-tabbar">
-        <button className="facet-tab" data-active={tab === '2d' || undefined} onClick={() => setTab('2d')}>2D 结构图</button>
-        <button className="facet-tab" data-active={tab === '3d' || undefined} onClick={() => setTab('3d')}>3D 视图</button>
-      </div>
-      <iframe
-        key={tab}
-        className="facet-frame"
-        src={`${ROUTE}/${artifact.slug}/${tab}.html`}
-        sandbox="allow-scripts allow-same-origin allow-popups"
-        title={`${artifact.query} ${tab}`}
-      />
     </div>
   )
 }
@@ -253,7 +330,7 @@ const CSS = `
 .facet-tabwrap{flex:1;display:flex;flex-direction:column;min-height:0}
 .facet-tabbar{display:flex;gap:4px;padding:6px 8px;border-bottom:1px solid #DEE2E6;background:#FAFAFA;flex:none}
 .facet-tab{border:1px solid #DEE2E6;background:#fff;color:#495057;border-radius:8px;padding:4px 12px;font-size:12px;cursor:pointer}
-.facet-tab[data-active]{border-color:#E8590C;color:#E8590C;font-weight:600}
+.facet-tab[data-active]{border-color:#1C7ED6;color:#1C7ED6;font-weight:600}
 `
 
 // ── 插件体 ───────────────────────────────────────────────────────────────

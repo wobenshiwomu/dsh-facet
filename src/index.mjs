@@ -1,26 +1,28 @@
 /**
- * dsh-facet — 模型架构可视化：/visualize → 结构化 spec → 双子代理 → 2D/3D。
+ * dsh-facet — 内容到图谱：/visualize → 生成计划（模式+视图）→ N 子代理 → 浮窗。
  *
- * 工作流（全部由宿主侧编排，智能活交给 agent）：
- *  1. 用户输入 `/visualize <模型名 | arXiv 链接>`（命令处理器校验参数、
- *     生成 slug 与产物目录、写 v meta.json，然后把"工作流提示词"以 user 消息
+ * 工作流（宿主侧只做确定性编排，智能活交给 agent）：
+ *  1. 用户输入 `/visualize <模型名 | arXiv 链接 | 一句话需求>`：命令处理器校验参数、
+ *     生成 slug 与产物目录、写 meta.json(pending)，读取自定义模式（modes/*.json），
+ *     然后把"工作流提示词"（含模式表/视图词表/spec 规范/风格铁律）以 user 消息
  *     注入当前 agent —— 与官方 /goal 命令同款：invocation.agent.followup(
- *     createUserMessage(...))）。
- *  2. 主 agent（按提示词）调研架构 → 写 `$DSH_HOME/facet/<slug>/spec.json`
- *     → 用 subagent 工具并行派发两个独立子代理 → 分别生成 2d.html / 3d.html。
- *  3. 主 agent 调 `facet_ready` 工具：宿主校验产物、更新 meta、通过 SSE
- *     通知客户端浮窗自动弹出，并把两个访问路径返回给 agent 放进最终回复。
+ *     createUserMessage(...))。
+ *  2. 主 agent 按提示词：理解内容 → 调研 → 定「生成计划」{mode, views:[…]} →
+ *     写 `$DSH_HOME/facet/<slug>/spec.json` → 用 subagent 工具为**每个视图**并行
+ *     派发一个独立子代理 → 生成 `<kind>.html`（diagram/tower/network/flow/timeline）。
+ *  3. 主 agent 调 `facet_ready` 工具：宿主校验视图文件、写 meta.views、通过 SSE
+ *     广播浮窗事件（载荷含 views），并把各视图访问链接回给 agent 放进最终回复。
  *
- * 风格一致性（本插件的灵魂）：STYLE_BLOCK / LAYOUT_BLOCK 是**唯一来源**，
- * 整段注入工作流提示词，并要求主 agent 全文复制进两份子代理提示词——
- * 用具体 hex 色值而不是颜色词，避免每次生成的视觉风格漂移。
+ * 设计纪律（与 prompts.mjs 同源）：**渲染层封闭**（视图词表 5 种 + 固定色板，
+ * 风格永不崩）、**语义层开放**（模式/schema/映射可生长；OOD 时可用 generic 兜底，
+ * 或按【自造模式规范】现场合成新模式存入 modes/ 供复用——"框架自己长大"）。
  *
  * HTTP（本机，经 ctx.webServer 可选挂载）：
- *  - GET /dsh-facet/              产物索引页
- *  - GET /dsh-facet/events        SSE：浮窗“ready”事件
+ *  - GET /dsh-facet/              产物索引页（按视图清单出链）
+ *  - GET /dsh-facet/events        SSE：浮窗“ready”事件（载荷含 views）
  *  - GET /dsh-facet/health        健康检查
  *  - GET /dsh-facet/debug/broadcast?slug=X   本机调试：立刻广播一次 ready（不触碰 meta）
- *  - GET /dsh-facet/<slug>/<file> 产物文件（2d.html / 3d.html / spec.json 等）
+ *  - GET /dsh-facet/<slug>/<file> 产物文件（diagram.html / tower.html / spec.json 等）
  *
  * @module dsh-facet
  */
@@ -32,6 +34,10 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import Schema from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand'
+import { STYLE_BLOCK, VIEW_KINDS, MODES, SPEC_BLOCK, buildWorkflowPrompt } from './prompts.mjs'
+
+// 提示词常量经本模块再导出（测试与外部消费的稳定入口）
+export { STYLE_BLOCK, VIEW_KINDS, MODES, SPEC_BLOCK, buildWorkflowPrompt }
 
 export const name = 'dsh-facet'
 // webServer 刻意不放进顶层 inject：headless 等没有 web 服务的几何下，
@@ -49,89 +55,6 @@ export const COMMAND_NAME = 'visualize'
 
 /** 产物目录名安全规则（同时用于路由防穿越）。 */
 const SAFE_SLUG = /^[a-z0-9][a-z0-9-]{0,63}$/
-
-// ---------------------------------------------------------------------------
-// 风格常量（唯一来源 —— 同时注入 2D 与 3D 两份子代理提示词）
-
-export const STYLE_BLOCK = `【风格铁律 · 只允许以下色值】
-- 画布背景：#FFFFFF 纯白（无渐变、无纹理）
-- 层类型配色（主色，用于填充或描边）：
-  · embedding（嵌入/词表）＝ #7048E8
-  · attention（注意力）＝ #E8590C
-  · ffn / moe（前馈/专家）＝ #1C7ED6
-  · norm（归一化）＝ #2F9E44
-  · state / recurrent（循环·状态类：SSM、GDN、Mamba 等线性注意力）＝ #AE3EC9
-  · head（输出头）＝ #343A40
-  · other（其它）＝ #868E96
-  · 连线与残差 ＝ #ADB5BD（1.5px）
-  · 重复组外框 ＝ #DEE2E6
-- 特殊标记：
-  · spec 中 custom:true 的块：本层主色 + 2px 加粗描边 + 右上角 ★
-  · spec 中 confidence:"low" 的字段：虚线边框 + 右上角 #FA5252 的 "?"
-- 文字：层名 #212529；维度/变体标注 #868E96 且小一号
-- 块：圆角 8px、内边距充足、线宽统一 1.5px；不用半透明；禁止渐变、阴影滥用、emoji、装饰图案`
-
-export const LAYOUT_BLOCK = `【布局约定】
-- 数据流自上而下：输入（Token Embedding）→ 重复块组 → 输出头（LM Head）
-- 重复组（group 节点）：一个外框（#DEE2E6）包住代表性子层，右上角标 "×N"；不要逐层复制
-- 残差/跳跃连接：画在右侧，浅灰弧线
-- 维度标注格式：d=4096 · h=32 · kv=8（用 · 分隔）
-- 页脚（右下角小字）：<模型名> · dsh-facet · 来源：<来源链接>`
-
-export const SPEC_SCHEMA_BLOCK = `{
-  "model": "Llama-3-8B",                    // 模型名
-  "params": "8.03B",                        // 参数量字符串（未知填 "unknown"）
-  "contextLength": 8192,                    // 可选
-  "sources": ["https://arxiv.org/abs/..."], // 来源链接列表
-  "confidence": "high",                     // 总体置信：high | medium | low
-  "notes": "歧义/低置信说明（可选）",
-  "stack": [                                // 自上而下的层堆叠
-    { "type": "embedding", "label": "Token Embedding", "dims": "vocab=128256 · d=4096", "confidence": "high" },
-    { "type": "group", "label": "Transformer Layer", "count": 32, "children": [
-      { "type": "norm", "label": "RMSNorm" },
-      { "type": "attention", "variant": "GQA", "label": "Self-Attention (GQA)", "dims": "h=32 · kv=8" },
-      { "type": "ffn", "variant": "SwiGLU", "label": "FFN (SwiGLU)", "dims": "d_ff=14336" }
-    ]},
-    { "type": "head", "label": "LM Head", "dims": "vocab=128256" }
-  ]
-}
-type 枚举：embedding | attention | ffn | moe | norm | state | head | other | group
-可选字段：variant（变体名）、custom:true（非标准/自研块）、confidence:"low"（低置信字段）`
-
-/**
- * 构建注入主 agent 的工作流提示词。
- * @param {{query: string, slug: string, dir: string}} p
- */
-export function buildWorkflowPrompt({ query, slug, dir }) {
-  return `【dsh-facet · /visualize 工作流】
-用户请求：/visualize ${query}
-
-你的任务：为「${query}」建立结构化架构描述（spec），并生成 2D 与 3D 两张架构图。严格按以下步骤执行：
-
-1) 调研架构。是 arXiv 链接就优先读论文本身（abs 页/HTML 版）；否则用搜索工具找官方模型卡或技术报告。需要收集：
-   · 堆叠结构：层数与重复方式
-   · 每层类型与变体（注意力类型、FFN 变体、归一化位置）
-   · 关键维度（d_model、头数、kv 头数、FFN 维度、词表大小）
-   · 参数量 · 特殊/非标准设计 · 来源链接（arXiv 号、模型卡）
-   名称有歧义→取最主流版本并在 notes 注明；查不到的字段禁止编造：填 "unknown" 并标 confidence:"low"。
-
-2) 写出 ${dir}/spec.json（目录不存在先创建）。严格按此 schema（注释只是说明，不要写进文件）：
-${SPEC_SCHEMA_BLOCK}
-
-3) 在回复里给用户一行摘要（不要贴 JSON）：
-   「已建模：<模型> · <层结构简述> · <参数量> · 来源=<来源>」，并点名低置信字段。
-
-4) 在【同一条消息】里用 subagent 工具发起两个并行委派（独立上下文）。两份提示词必须完整自包含，并把下面【风格铁律】【布局约定】全文复制进每一份：
-   · 子代理 A → 生成 ${dir}/2d.html：单文件 HTML、零外部依赖（内联 CSS + 手写内联 SVG），自上而下的分层架构图；先读 spec.json 再动手。
-   · 子代理 B → 生成 ${dir}/3d.html：单文件 HTML，three.js 自包含页面（importmap 引 CDN：https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js 与 https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/controls/OrbitControls.js）；3D 分层堆叠视图、白色背景、柔和环境光、块=圆角盒、重复组=半透明外框+×N 标签块、可旋转缩放（触摸可用）、加载后缓慢自转、右下角 HTML 页脚覆盖层；先读 spec.json 再动手。
-
-5) 两个子代理都完成后调用工具 facet_ready（slug="${slug}"）——它会校验产物、返回两个访问路径并通知界面自动弹出窗口。最终回复里给出它返回的链接；不要粘贴 HTML 源码。
-
-${STYLE_BLOCK}
-
-${LAYOUT_BLOCK}
-`
-}
 
 // ---------------------------------------------------------------------------
 // 工具函数
@@ -153,7 +76,7 @@ export function facetRoot(config) {
  */
 export function slugify(input) {
   const s = String(input ?? '').trim()
-  if (s.length === 0) return 'model'
+  if (s.length === 0) return 'req'
   const urlMatch = /arxiv\.org\/(?:abs|pdf|html)\/(\d{4}\.\d{4,5})(?:v\d+)?/i.exec(s)
   const bareMatch = /^(\d{4}\.\d{4,5})(?:v\d+)?$/.exec(s)
   const arxivId = urlMatch !== null ? urlMatch[1] : (bareMatch !== null ? bareMatch[1] : undefined)
@@ -161,9 +84,72 @@ export function slugify(input) {
   let slug = s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64).replace(/-+$/g, '')
   if (slug.length === 0) {
     const hash = createHash('sha1').update(s).digest('hex').slice(0, 8)
-    slug = `model-${hash}`
+    slug = `req-${hash}`
   }
   return slug
+}
+
+/**
+ * 读取自定义模式（OOD 自造，存于 <root>/modes/*.json）。
+ * 约束：name 小写 kebab（2-32）；views ⊆ 视图词表（1-3 个）；colors 只做展示。
+ * 坏文件静默跳过（框架不被一颗坏 JSON 卡死）。
+ */
+export function loadCustomModes(root) {
+  const dir = path.join(root, 'modes')
+  let files = []
+  try {
+    files = fs.readdirSync(dir).filter((f) => f.endsWith('.json'))
+  } catch {
+    return []
+  }
+  const out = []
+  for (const f of files) {
+    try {
+      const m = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))
+      const modeName = String(m?.name ?? '').trim()
+      if (!/^[a-z0-9-]{2,32}$/.test(modeName)) continue
+      const views = Array.isArray(m?.views) ? m.views.filter((v) => typeof v === 'string' && VIEW_KINDS[v] !== undefined).slice(0, 3) : []
+      if (views.length === 0) continue
+      const colors = m?.colors !== undefined && typeof m.colors === 'object' && m.colors !== null ? m.colors : {}
+      out.push({ name: modeName, label: String(m?.label ?? modeName), views, colors })
+    } catch {
+      /* 坏文件跳过 */
+    }
+  }
+  return out
+}
+
+/**
+ * 解析某产物的视图清单（三跳回退）：
+ *  1. meta.views（ready 写入的标准路径）
+ *  2. 目录扫描视图词表文件名（diagram.html / tower.html / ...）
+ *  3. 旧版 2d.html / 3d.html（向后兼容）
+ * @returns {Array<{kind: string, file: string, title: string}>}
+ */
+export function resolveViews(root, slug) {
+  const dir = path.join(root, slug)
+  const meta = readMeta(dir)
+  if (Array.isArray(meta?.views) && meta.views.length > 0) {
+    const out = []
+    for (const v of meta.views) {
+      const kind = String(v?.kind ?? '')
+      if (kind.length === 0) continue
+      const file = typeof v.file === 'string' && v.file.length > 0 ? v.file : (VIEW_KINDS[kind]?.file ?? '')
+      if (file.length === 0) continue
+      const title = typeof v.title === 'string' && v.title.length > 0 ? v.title : (VIEW_KINDS[kind]?.title ?? kind)
+      out.push({ kind, file, title })
+    }
+    if (out.length > 0) return out
+  }
+  const scanned = []
+  for (const [kind, spec] of Object.entries(VIEW_KINDS)) {
+    if (fs.existsSync(path.join(dir, spec.file))) scanned.push({ kind, file: spec.file, title: spec.title })
+  }
+  if (scanned.length > 0) return scanned
+  const legacy = []
+  if (fs.existsSync(path.join(dir, '2d.html'))) legacy.push({ kind: 'diagram', file: '2d.html', title: '2D 结构图' })
+  if (fs.existsSync(path.join(dir, '3d.html'))) legacy.push({ kind: 'tower', file: '3d.html', title: '3D 视图' })
+  return legacy
 }
 
 function sendJson(res, status, obj) {
@@ -215,8 +201,7 @@ function writeMeta(dir, meta) {
 }
 
 // ---------------------------------------------------------------------------
-// SSE 枢纽（浮窗自动弹出的通知通道 —— 形态与 dsh-bite 的客户端轮询不同，
-// 这里用 EventSource：无需客户端 bundle 参与即可被任意前端订阅）
+// SSE 枢纽（浮窗自动弹出的通知通道）
 
 const sseClients = new Set()
 
@@ -248,7 +233,7 @@ function sseCloseAll() {
 export async function cmdSearchModel(invocation, deps) {
   const query = String(invocation.rawInput ?? '').trim()
   if (query.length === 0) {
-    return { kind: 'error', text: '用法：/visualize <模型名 | arXiv 链接>（例：/visualize Llama-3-8B）' }
+    return { kind: 'error', text: '用法：/visualize <模型名 | arXiv 链接 | 一句话需求>（例：/visualize Llama-3-8B，或 /visualize 把 GRPO 的训练流程画出来）' }
   }
   const slug = slugify(query)
   if (!SAFE_SLUG.test(slug)) {
@@ -269,13 +254,25 @@ export async function cmdSearchModel(invocation, deps) {
     status: 'pending',
   })
 
-  const prompt = buildWorkflowPrompt({ query, slug, dir })
+  let customModes = []
+  try {
+    customModes = loadCustomModes(deps.root)
+  } catch {
+    /* 坏模式目录不阻断 */
+  }
+  const prompt = buildWorkflowPrompt({
+    query,
+    slug,
+    dir,
+    modesDir: path.join(deps.root, 'modes'),
+    customModes,
+  })
   invocation.agent.followup(createUserMessage({
     content: [{ type: 'text', text: prompt }],
     source: { kind: SOURCE_KIND, subtype: 'workflow', slug, query },
   }))
 
-  return { kind: 'success', text: `dsh-facet 已就位：正在调研「${query}」，将生成 2D/3D 架构图（产物目录 facet/${slug}/）。` }
+  return { kind: 'success', text: `dsh-facet 已就位：正在调研「${query}」并生成图谱计划（产物目录 facet/${slug}/）。` }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,14 +280,31 @@ export async function cmdSearchModel(invocation, deps) {
 
 function buildReadyTool(deps) {
   const { root, config, ctx } = deps
+  const kindList = Object.keys(VIEW_KINDS).join(' | ')
   return defineTool({
     name: 'facet_ready',
-    description: '校验 dsh-facet 产物（2d.html / 3d.html）并通知界面自动弹出可视化窗口；返回两个访问路径。在 /visualize 工作流的两个子代理都完成后调用一次。',
+    description: `校验 dsh-facet 产物视图（按视图词表 ${kindList} 对应的 <kind>.html）并通知界面自动弹出可视化窗口；返回各视图访问链接。在 /visualize 工作流的所有子代理完成后调用一次。`,
     parameters: {
       slug: {
         type: 'string',
         required: true,
-        description: '产物目录名（/visualize 命令输出的 slug，例如 llama-3-8b 或 arxiv-2407-21783）',
+        description: '产物目录名（/visualize 命令输出的 slug，例如 llama-3-8b / arxiv-2407-21783 / req-1a2b3c4d）',
+      },
+      mode: {
+        type: 'string',
+        description: '生成计划里的模式名（如 model-architecture / rl-training / red-team / workflow / generic 或自定义模式名；仅用于记录）',
+      },
+      views: {
+        type: 'array',
+        description: `生成计划的视图清单：每项 = 一个已生成的视图（kind 取自词表 ${kindList}；title 可自定义）。缺省时回退读取 meta.views 或扫描目录。最多 3 项。`,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            kind: { type: 'string', required: true, description: `视图种类（${kindList}）` },
+            title: { type: 'string', description: '窗口标题（缺省用词表标题）' },
+          },
+        },
       },
     },
     output: {
@@ -301,8 +315,18 @@ function buildReadyTool(deps) {
           ok: { type: 'boolean', required: true },
           slug: { type: 'string', required: true },
           message: { type: 'string', required: true },
-          twoD: { type: 'string' },
-          threeD: { type: 'string' },
+          urls: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                kind: { type: 'string', required: true },
+                title: { type: 'string', required: true },
+                url: { type: 'string', required: true },
+              },
+            },
+          },
           missing: { type: 'array', items: { type: 'string' } },
         },
       },
@@ -314,39 +338,79 @@ function buildReadyTool(deps) {
         return { ok: false, slug, message: `slug "${slug}" 非法：只允许小写字母/数字/中划线（≤64 字符）。请用 /visualize 输出的 slug 重试。` }
       }
       const dir = path.join(root, slug)
-      const twoD = path.join(dir, '2d.html')
-      const threeD = path.join(dir, '3d.html')
-      const has2d = fs.existsSync(twoD)
-      const has3d = fs.existsSync(threeD)
-      const missing = []
-      if (!has2d) missing.push('2d.html')
-      if (!has3d) missing.push('3d.html')
+
+      // 解析视图清单：参数 > meta > 目录扫描（含 legacy 回退）
+      let views = []
+      if (Array.isArray(args.views) && args.views.length > 0) {
+        const badKinds = []
+        for (const v of args.views) {
+          const kind = String(v?.kind ?? '').trim()
+          if (VIEW_KINDS[kind] === undefined) {
+            badKinds.push(kind.length > 0 ? kind : '(空)')
+            continue
+          }
+          if (views.some((x) => x.kind === kind)) continue
+          const title = String(v?.title ?? '').trim()
+          views.push({ kind, file: VIEW_KINDS[kind].file, title: title.length > 0 ? title : VIEW_KINDS[kind].title })
+        }
+        if (badKinds.length > 0) {
+          return { ok: false, slug, message: `views 里出现未知 kind：${badKinds.join('、')}。只允许：${kindList}。` }
+        }
+        if (views.length > 3) {
+          return { ok: false, slug, message: 'views 最多 3 个（视图数 = 子代理数上限）。' }
+        }
+      }
+      if (views.length === 0) views = resolveViews(root, slug)
+      if (views.length === 0) {
+        return {
+          ok: false,
+          slug,
+          message: `目录 ${dir} 下没有找到任何视图文件（按词表 ${kindList} 或 legacy 2d.html/3d.html 扫描）。请先让子代理产出，再调用 facet_ready。`,
+        }
+      }
+
+      const missing = views.filter((v) => !fs.existsSync(path.join(dir, v.file))).map((v) => v.file)
       if (missing.length > 0) {
         return {
           ok: false,
           slug,
-          message: `产物尚未就绪：缺少 ${missing.join('、')}。请确认两个子代理已完成并写入 ${dir}/，然后再次调用 facet_ready。`,
+          message: `产物尚未就绪：缺少 ${missing.join('、')}。请确认对应子代理已完成并写入 ${dir}/，然后再次调用 facet_ready。`,
           missing,
-          ...(has2d ? { twoD: `${ROUTE_PREFIX}/${slug}/2d.html` } : {}),
-          ...(has3d ? { threeD: `${ROUTE_PREFIX}/${slug}/3d.html` } : {}),
         }
       }
+
       const meta = readMeta(dir) ?? { slug }
-      writeMeta(dir, { ...meta, slug, updatedAt: new Date().toISOString(), status: 'ready' })
+      const mode = typeof args.mode === 'string' && args.mode.trim().length > 0
+        ? args.mode.trim().slice(0, 64)
+        : (typeof meta.mode === 'string' && meta.mode.length > 0 ? meta.mode : undefined)
+      writeMeta(dir, {
+        ...meta,
+        slug,
+        ...(mode !== undefined ? { mode } : {}),
+        views,
+        updatedAt: new Date().toISOString(),
+        status: 'ready',
+      })
+      const urls = views.map((v) => ({ kind: v.kind, title: v.title, url: `${ROUTE_PREFIX}/${slug}/${v.file}` }))
       if (config.readyPing) {
-        sseBroadcast('ready', { slug, query: meta.query ?? slug, twoD: `${ROUTE_PREFIX}/${slug}/2d.html`, threeD: `${ROUTE_PREFIX}/${slug}/3d.html` })
+        sseBroadcast('ready', {
+          slug,
+          query: meta.query ?? slug,
+          mode: mode ?? null,
+          views: urls,
+        })
       }
       try {
-        ctx.logger.info(`[dsh-facet] 产物就绪：${slug}`)
+        ctx.logger.info(`[dsh-facet] 产物就绪：${slug}（${views.map((v) => v.kind).join(' + ')}）`)
       } catch {
         /* logger 不可用时忽略 */
       }
+      const linkText = urls.map((u) => `${u.url}（${u.title}）`).join(' 与 ')
       return {
         ok: true,
         slug,
-        message: `产物就绪并已通知界面。请把这两个链接放进最终回复：${ROUTE_PREFIX}/${slug}/2d.html（2D）与 ${ROUTE_PREFIX}/${slug}/3d.html（3D）。`,
-        twoD: `${ROUTE_PREFIX}/${slug}/2d.html`,
-        threeD: `${ROUTE_PREFIX}/${slug}/3d.html`,
+        message: `产物就绪并已通知界面。请把链接放进最终回复：${linkText}。`,
+        urls,
       }
     },
   })
@@ -359,25 +423,27 @@ function renderIndexPage(root) {
   let names = []
   try {
     names = fs.readdirSync(root, { withFileTypes: true })
-      .filter((d) => d.isDirectory() && SAFE_SLUG.test(d.name))
+      .filter((d) => d.isDirectory() && d.name !== 'modes' && SAFE_SLUG.test(d.name))
       .map((d) => d.name)
   } catch {
     /* 目录不可读时给空列表 */
   }
   const items = names.map((slug) => {
-    const dir = path.join(root, slug)
-    const meta = readMeta(dir)
-    const has2d = fs.existsSync(path.join(dir, '2d.html'))
-    const has3d = fs.existsSync(path.join(dir, '3d.html'))
+    const meta = readMeta(path.join(root, slug))
+    const views = resolveViews(root, slug)
     const title = escapeHtml(meta?.query ?? slug)
-    const links = [
-      has2d ? `<a href="./${slug}/2d.html">2D</a>` : '2D…',
-      has3d ? `<a href="./${slug}/3d.html">3D</a>` : '3D…',
-      meta?.status === 'ready' ? '✅' : '⏳',
-    ].join(' · ')
-    return `<li><b>${title}</b> <small><code>${slug}</code></small> — ${links}</li>`
+    const links = views.length > 0
+      ? views.map((v) => `<a href="./${slug}/${encodeURIComponent(v.file)}">${escapeHtml(v.title)}</a>`).join(' · ')
+      : '（无产物）'
+    const status = meta?.status === 'ready' ? '✅' : '⏳'
+    const modeTag = typeof meta?.mode === 'string' && meta.mode.length > 0 ? ` <small>[${escapeHtml(meta.mode)}]</small>` : ''
+    return `<li><b>${title}</b> <small><code>${slug}</code></small>${modeTag} — ${links} ${status}</li>`
   }).join('\n')
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>dsh-facet</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#fff;color:#212529;margin:40px;max-width:760px;line-height:1.6}li{margin:8px 0}a{color:#1C7ED6}code{color:#868E96}</style></head><body><h1>dsh-facet</h1><p>已生成的模型架构图（在对话里用 <code>/visualize &lt;模型名 | arXiv 链接&gt;</code> 生成新的）：</p><ul>\n${items.length > 0 ? items : '<li>（空）</li>'}\n</ul></body></html>`
+  const customModes = loadCustomModes(root)
+  const modesLine = customModes.length > 0
+    ? `<p><small>自定义模式：${customModes.map((m) => `${escapeHtml(m.name)}（${escapeHtml(m.label)}）`).join(' · ')}</small></p>`
+    : ''
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>dsh-facet</title><style>body{font-family:system-ui,-apple-system,sans-serif;background:#fff;color:#212529;margin:40px;max-width:760px;line-height:1.6}li{margin:8px 0}a{color:#1C7ED6}code{color:#868E96}</style></head><body><h1>dsh-facet</h1><p>已生成的图谱（在对话里用 <code>/visualize &lt;名字 | arXiv 链接 | 一句话需求&gt;</code> 生成新的）：</p><ul>\n${items.length > 0 ? items : '<li>（空）</li>'}\n</ul>${modesLine}</body></html>`
 }
 
 export function makeRouteHandler(root) {
@@ -394,14 +460,16 @@ export function makeRouteHandler(root) {
       if (route === `${ROUTE_PREFIX}/debug/broadcast` && req.method === 'GET') {
         const slug = url.searchParams.get('slug') ?? ''
         if (!SAFE_SLUG.test(slug)) return sendJson(res, 400, { ok: false, code: 'bad-slug' })
+        const views = resolveViews(root, slug)
+        if (views.length === 0) return sendJson(res, 404, { ok: false, code: 'no-views' })
         const meta = readMeta(path.join(root, slug))
         sseBroadcast('ready', {
           slug,
           query: meta?.query ?? slug,
-          twoD: `${ROUTE_PREFIX}/${slug}/2d.html`,
-          threeD: `${ROUTE_PREFIX}/${slug}/3d.html`,
+          mode: meta?.mode ?? null,
+          views: views.map((v) => ({ kind: v.kind, title: v.title, url: `${ROUTE_PREFIX}/${slug}/${v.file}` })),
         })
-        return sendJson(res, 200, { ok: true, broadcast: 'ready', slug })
+        return sendJson(res, 200, { ok: true, broadcast: 'ready', slug, views: views.map((v) => v.file) })
       }
 
       if (route === `${ROUTE_PREFIX}/events`) {
@@ -430,7 +498,7 @@ export function makeRouteHandler(root) {
       const rest = route.slice(ROUTE_PREFIX.length + 1)
       const segs = rest.split('/').map((s) => decodeURIComponent(s))
       const slug = segs[0] ?? ''
-      if (!SAFE_SLUG.test(slug)) {
+      if (!SAFE_SLUG.test(slug) || slug === 'modes') {
         return sendJson(res, 404, { ok: false, code: 'bad-slug' })
       }
       const dir = path.join(root, slug)
@@ -492,8 +560,8 @@ export function apply(ctx, config) {
     yield ctx.commands.register({
       definitionId: CommandDefinitionId('dsh-facet/visualize'),
       name: COMMAND_NAME,
-      description: 'facet：调研模型架构并生成 2D/3D 可视化（接受模型名或 arXiv 链接）',
-      input: { hint: '模型名或 arXiv 链接（例：Llama-3-8B / https://arxiv.org/abs/2407.21783）' },
+      description: 'facet：调研内容并生成 2D/3D 图谱（模型名 / arXiv 链接 / 一句话需求皆可）',
+      input: { hint: '模型名、arXiv 链接或一句需求（例：Llama-3-8B / https://arxiv.org/abs/2407.21783 / 把 GRPO 训练流程画出来）' },
       handler: (invocation) => cmdSearchModel(invocation, deps),
     })
   }, 'dsh-facet: commands')
@@ -523,7 +591,7 @@ export function apply(ctx, config) {
   }
 
   ctx.effect(() => {
-    const banner = `[dsh-facet] 已加载（产物目录 ${root}，命令 /${COMMAND_NAME}）`
+    const banner = `[dsh-facet] 已加载（产物目录 ${root}，命令 /${COMMAND_NAME}，模式 ${Object.keys(MODES).length} 个）`
     ctx.logger.info(banner)
     console.log(banner)
     return () => ctx.logger.info('[dsh-facet] 已卸载')

@@ -1,6 +1,6 @@
 {
   "name": "dsh-facet",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DeepSeek Harness 插件：模型架构可视化 —— /visualize 一个模型名或 arXiv 链接，主 agent 自动调研成 spec.json，双子代理并行生成 2D（SVG）与 3D（three.js）架构图，浮窗直接弹出",
   "keywords": [
     "dsh",
